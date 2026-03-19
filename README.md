@@ -13,14 +13,12 @@
 - PDF 论文中文结构化速读摘要
 - 原生 `HTML + CSS + JS` 前端工作台
 
-```
+
 
 ## 安全说明
 
 仓库默认不提交以下内容：
-
 - `.env` 和实际密钥
-- `langgraph入门/`、`Mem0/` 中的本地密钥文件
 - `storage/` 上传文件
 - `data/` 本地运行数据
 - `node_modules/`、`.trigger/`、Python 缓存
