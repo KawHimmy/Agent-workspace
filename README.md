@@ -13,30 +13,6 @@
 - PDF 论文中文结构化速读摘要
 - 原生 `HTML + CSS + JS` 前端工作台
 
-## 项目结构
-
-- `apps/api_py`: Python 主后端
-- `apps/auth`: Better Auth sidecar
-- `apps/web/static`: 前端静态页面
-- `packages/mcp-servers`: MCP 工具服务
-- `src/trigger`: Trigger.dev 任务
-- `supabase`: 数据库迁移
-
-## 本地启动
-
-1. 安装 Python 依赖
-2. 安装 Node.js 依赖
-3. 配置 `.env`
-4. 运行：
-
-```bash
-npm start
-```
-
-默认前端入口：
-
-```text
-http://localhost:3000
 ```
 
 ## 安全说明
