@@ -1,6 +1,7 @@
 # Agent-workspace
 
 一个以 `FastAPI + LangGraph + MCP + Mem0 + Trigger.dev` 为核心的 ReAct Agent 工作台。
+(更多功能实现中......)
 
 ## 当前能力
 
