@@ -21,4 +21,4 @@
 - `.env` 和实际密钥
 - `storage/` 上传文件
 - `data/` 本地运行数据
-- `node_modules/`,`.trigger/`,Python 缓存
+- node_modules,trigger,Python 缓存
