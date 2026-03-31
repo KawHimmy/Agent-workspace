@@ -10,20 +10,20 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=20260319b" />
+    <link rel="stylesheet" href="/styles.css?v=20260331a" />
   </head>
   <body>
     <div class="page-shell">
       <aside class="sidebar">
         <section class="brand-card">
-          <span class="eyebrow">Stage 1 Workspace</span>
+          <span class="eyebrow">Stage 2 Workspace</span>
           <h1>ReAct Agent 工作台</h1>
-          <p>把聊天任务、论文理解、工具调用和长期记忆放进同一个简洁但完整的工作台里。</p>
+          <p>把任务、文档、工具、长期记忆和执行轨迹全部放进同一个可调试的工作台里。</p>
           <div class="brand-pills">
-            <span class="pill">Python Agent</span>
-            <span class="pill">LangGraph</span>
-            <span class="pill">MCP</span>
-            <span class="pill">Mem0</span>
+            <span class="pill">LangGraph Trace</span>
+            <span class="pill">MCP Tools</span>
+            <span class="pill">Trigger.dev</span>
+            <span class="pill">Audit + Usage</span>
           </div>
         </section>
 
@@ -79,6 +79,16 @@
             <strong id="user-name">-</strong>
             <span id="user-email" class="mono">-</span>
           </div>
+          <div class="workspace-switch">
+            <label>
+              <span>当前工作区</span>
+              <select id="workspace-select"></select>
+            </label>
+            <div class="action-row">
+              <span id="current-workspace-role" class="tag">owner</span>
+              <button id="new-workspace-button" type="button" class="ghost">新建工作区</button>
+            </div>
+          </div>
         </section>
 
         <section class="panel">
@@ -97,10 +107,10 @@
         <section class="hero">
           <div class="hero-copy">
             <span class="eyebrow">Agent Runtime</span>
-            <h2>让任务、文档和记忆在同一块画布里协同</h2>
+            <h2>从结果提升到“可解释、可追踪、可重试”</h2>
             <p id="status-banner">系统待命中，登录后即可开始使用。</p>
           </div>
-          <div class="hero-metrics">
+          <div class="hero-metrics metrics-six">
             <article class="metric-card">
               <span>会话</span>
               <strong id="conversation-count">0</strong>
@@ -117,36 +127,57 @@
               <span>记忆</span>
               <strong id="preference-count">0</strong>
             </article>
+            <article class="metric-card">
+              <span>工具</span>
+              <strong id="tool-count">0</strong>
+            </article>
+            <article class="metric-card">
+              <span>运行</span>
+              <strong id="run-count">0</strong>
+            </article>
           </div>
         </section>
 
         <div class="workspace-grid">
-          <section class="panel chat-panel">
-            <div class="panel-header panel-header-tight">
-              <div>
-                <span class="panel-kicker">Chat</span>
-                <h2>任务对话</h2>
-              </div>
-              <span class="mono" id="active-conversation-label">未选择会话</span>
-            </div>
-
-            <div id="message-list" class="message-list"></div>
-
-            <div class="composer-shell">
-              <form id="chat-form" class="composer">
-                <textarea
-                  id="prompt-input"
-                  name="prompt"
-                  rows="1"
-                  placeholder="例如：结合我上传的论文，帮我总结方法亮点，并指出最值得继续细读的实验部分。"
-                  required
-                ></textarea>
-                <div class="composer-actions">
-                  <span class="mono">Enter 发送，Shift + Enter 换行</span>
-                  <button id="send-button" type="submit">发送任务</button>
+          <section class="main-stack">
+            <section class="panel chat-panel">
+              <div class="panel-header panel-header-tight">
+                <div>
+                  <span class="panel-kicker">Chat</span>
+                  <h2>任务对话</h2>
                 </div>
-              </form>
-            </div>
+                <span class="mono" id="active-conversation-label">未选择会话</span>
+              </div>
+
+              <div id="message-list" class="message-list"></div>
+
+              <div class="composer-shell">
+                <form id="chat-form" class="composer">
+                  <textarea
+                    id="prompt-input"
+                    name="prompt"
+                    rows="1"
+                    placeholder="例如：结合我上传的论文、GitHub 仓库和技术路线模板，帮我生成一版更适合写进简历的项目描述。"
+                    required
+                  ></textarea>
+                  <div class="composer-actions">
+                    <span class="mono">Enter 发送，Shift + Enter 换行</span>
+                    <button id="send-button" type="submit">发送任务</button>
+                  </div>
+                </form>
+              </div>
+            </section>
+
+            <section class="panel trace-panel">
+              <div class="panel-header">
+                <div>
+                  <span class="panel-kicker">Trace</span>
+                  <h2>运行明细</h2>
+                </div>
+                <span class="mono" id="active-run-label">未选择运行</span>
+              </div>
+              <div id="run-detail" class="run-detail"></div>
+            </section>
           </section>
 
           <section class="side-stack">
@@ -174,7 +205,7 @@
                   <span class="panel-kicker">Jobs</span>
                   <h2>后台任务</h2>
                 </div>
-                <span class="mono">异步状态</span>
+                <span class="mono">异步状态 + 重试</span>
               </div>
               <div id="job-list" class="job-list"></div>
             </section>
@@ -185,15 +216,52 @@
                   <span class="panel-kicker">Memory</span>
                   <h2>长期记忆</h2>
                 </div>
-                <span class="mono">Mem0 / local</span>
+                <button id="refresh-memory-button" class="ghost">刷新</button>
               </div>
               <div id="preference-list" class="preference-list"></div>
+              <div class="subsection-title">最近写回</div>
+              <div id="memory-writeback-list" class="writeback-list"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <span class="panel-kicker">Tools</span>
+                  <h2>MCP 工具</h2>
+                </div>
+                <button id="connect-tools-button" class="ghost">同步</button>
+              </div>
+              <div id="tool-list" class="tool-list"></div>
+              <div class="subsection-title">工具测试</div>
+              <form id="tool-test-form" class="stack-form compact-form">
+                <label>
+                  <span>工具</span>
+                  <select id="tool-select" name="toolName"></select>
+                </label>
+                <label>
+                  <span>参数 JSON</span>
+                  <textarea id="tool-arguments" rows="4" spellcheck="false">{}</textarea>
+                </label>
+                <button type="submit">测试工具</button>
+              </form>
+              <div id="tool-test-result" class="tool-test-result empty-state">还没有测试结果。</div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-header">
+                <div>
+                  <span class="panel-kicker">Runs</span>
+                  <h2>运行记录</h2>
+                </div>
+                <span class="mono">Trace / Usage / Output</span>
+              </div>
+              <div id="run-list" class="run-list"></div>
             </section>
           </section>
         </div>
       </main>
     </div>
 
-    <script type="module" src="/app.js?v=20260319b"></script>
+    <script type="module" src="/app.js?v=20260331a"></script>
   </body>
 </html>

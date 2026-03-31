@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 
 from .config import settings
-from .store import list_preferences_by_user, upsert_preference
+from .store import create_memory_writeback, list_preferences_by_user, upsert_preference
 
 
 def _extract_preference_candidates(text: str) -> list[tuple[str, str]]:
@@ -59,17 +59,36 @@ async def retrieve_memory_context(user_id: str, query: str) -> dict[str, Any]:
 
 
 async def write_conversation_memory(
-    user_id: str, user_message: str, assistant_message: str
+    user_id: str,
+    conversation_id: str | None,
+    user_message: str,
+    assistant_message: str,
 ) -> dict[str, str]:
+    extracted_items: list[dict[str, str]] = []
     for key, value in _extract_preference_candidates(f"{user_message}\n{assistant_message}"):
-        await upsert_preference(
+        preference = await upsert_preference(
             user_id=user_id,
             key=key,
             value=value,
             source="mem0+local" if settings.mem0_api_key else "local",
         )
+        extracted_items.append(
+            {
+                "id": preference["id"],
+                "key": preference["key"],
+                "value": preference["value"],
+                "source": preference["source"],
+            }
+        )
 
     if not settings.mem0_api_key:
+        await create_memory_writeback(
+            user_id,
+            conversation_id=conversation_id,
+            source="local-only",
+            summary=assistant_message[:500],
+            items=extracted_items,
+        )
         return {"source": "local-only"}
 
     try:
@@ -91,6 +110,20 @@ async def write_conversation_memory(
                 },
             )
             response.raise_for_status()
+            await create_memory_writeback(
+                user_id,
+                conversation_id=conversation_id,
+                source="mem0",
+                summary=assistant_message[:500],
+                items=extracted_items,
+            )
             return {"source": "mem0"}
     except Exception:
+        await create_memory_writeback(
+            user_id,
+            conversation_id=conversation_id,
+            source="local-fallback",
+            summary=assistant_message[:500],
+            items=extracted_items,
+        )
         return {"source": "local-fallback"}
