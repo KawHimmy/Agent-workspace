@@ -1,2 +1,14 @@
+.env
+.env.*
+!.env.example
+
 .trigger
 node_modules
+__pycache__/
+*.pyc
+
+data/
+storage/
+
+langgraph入门/
+Mem0/
