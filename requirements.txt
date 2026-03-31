@@ -6,3 +6,4 @@ langgraph
 langchain-openai
 mcp
 pypdf
+psycopg[binary]

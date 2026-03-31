@@ -1,167 +1,202 @@
 from __future__ import annotations
-# 让类型注解延迟解析：
-# 1. 可以更方便地写现代类型标注，比如 dict[str, Any] | None
-# 2. 避免某些类型在定义时还没准备好就被立刻求值
 
 import asyncio
-# asyncio：Python 异步编程标准库
-# 这里主要用它的 Lock，避免多个协程同时读写同一个 JSON 文件造成数据覆盖
-
 import json
-# json：负责 Python 对象 和 JSON 字符串 之间的互相转换
-
+import re
 import uuid
-# uuid：用于生成全局唯一 ID，适合给会话、消息、任务等记录当主键
-
 from copy import deepcopy
-# deepcopy：深拷贝，避免直接复用 INITIAL_STORE 导致原始模板被修改
-
-from datetime import datetime, timezone
-# datetime / timezone：用于生成带时区的当前时间
-# 这里统一使用 UTC 时间，便于后续排序和跨时区处理
-
-from typing import Any
-# Any：类型注解中表示“任意类型”
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, TypeVar
 
 from .config import settings
-# 从当前项目的 config 模块导入 settings
-# 这里最关键的是 settings.store_file，它表示 JSON 存储文件的路径
 
+try:
+    import psycopg
+except Exception:  # pragma: no cover - optional dependency
+    psycopg = None
 
-# 整个 JSON 存储文件的初始结构
-# 外层是一个字典，每个 key 对应一类“表”
-# 每一类表的值都是一个列表，列表中每个元素都是一条记录（字典）
-INITIAL_STORE: dict[str, list[dict[str, Any]]] = {
-    "conversations": [],     # 会话列表
-    "messages": [],          # 消息列表
-    "agentRuns": [],         # 智能体运行记录
-    "documents": [],         # 文档记录
-    "backgroundJobs": [],    # 后台任务记录
-    "userPreferences": [],   # 用户偏好设置
+Store = dict[str, list[dict[str, Any]]]
+StoreMutator = Callable[[Store], Any]
+T = TypeVar("T")
+
+INITIAL_STORE: Store = {
+    "conversations": [],
+    "messages": [],
+    "agentRuns": [],
+    "agentSteps": [],
+    "toolCallLogs": [],
+    "runEvents": [],
+    "documents": [],
+    "backgroundJobs": [],
+    "userPreferences": [],
+    "memoryWritebacks": [],
+    "auditLogs": [],
+    "modelUsageLogs": [],
+    "rateLimitEvents": [],
+    "promptVersions": [],
+    "mcpServers": [],
+    "mcpServerConnections": [],
+    "toolRegistry": [],
+    "workspaces": [],
+    "workspaceMembers": [],
 }
 
-# 全局异步锁
-# 用来保护对 store 文件的读写，避免多个协程同时操作文件引发数据竞争
 _store_lock = asyncio.Lock()
+_DATABASE_STORE_ID = "react-agent-workspace"
 
 
 def _now() -> str:
-    """
-    返回当前 UTC 时间的 ISO 格式字符串。
-    例如：'2026-03-22T08:30:15.123456+00:00'
-    """
     return datetime.now(timezone.utc).isoformat()
 
 
-async def ensure_store() -> None:
-    """
-    确保存储文件存在。
-
-    逻辑：
-    1. 先确保 store 文件所在目录存在
-    2. 如果 store 文件不存在，则创建一个初始 JSON 文件
-    """
-    # parent 取到文件所在目录
-    # mkdir(parents=True, exist_ok=True) 表示：
-    # - 如果父目录不存在，就连父目录一起创建
-    # - 如果目录已经存在，不报错
-    settings.store_file.parent.mkdir(parents=True, exist_ok=True)
-
-    # 如果存储文件还不存在，则写入一个初始结构
-    if not settings.store_file.exists():
-        _write_store_unlocked(deepcopy(INITIAL_STORE))
-
-
 def _normalize_json(raw: str) -> str:
-    """
-    清理读取出来的 JSON 文本，避免一些常见问题。
-
-    处理内容：
-    1. 去掉 UTF-8 BOM（某些 Windows 编辑器会自动在文件开头加这个）
-    2. 去掉首尾空白字符
-
-    如果不去掉 BOM，json.loads 可能会报错。
-    """
     return raw.lstrip("\ufeff").strip()
 
 
-def _write_store_unlocked(store: dict[str, list[dict[str, Any]]]) -> None:
-    """
-    底层写文件函数：把整个 store 写入 JSON 文件。
+def _normalize_store_shape(store: dict[str, Any] | None) -> Store:
+    normalized: Store = deepcopy(INITIAL_STORE)
+    if not isinstance(store, dict):
+        return normalized
 
-    注意：
-    - 这个函数本身“不加锁”
-    - 调用者必须自己保证调用时是安全的
-    - 所以一般只在已经持有锁的上下文里调用
-    """
+    for key, value in store.items():
+        if isinstance(value, list):
+            normalized[key] = value
+
+    return normalized
+
+
+def _use_database_store() -> bool:
+    return bool(settings.database_url and psycopg is not None)
+
+
+def _connect_database():
+    if not settings.database_url or psycopg is None:
+        raise RuntimeError("Database store is not configured.")
+    return psycopg.connect(settings.database_url)
+
+
+def _ensure_database_store_table_unlocked() -> None:
+    with _connect_database() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                create table if not exists app_runtime_store (
+                  id text primary key,
+                  payload jsonb not null default '{}'::jsonb,
+                  updated_at timestamptz not null default now()
+                )
+                """
+            )
+        connection.commit()
+
+
+def _write_store_to_database_unlocked(store: Store) -> None:
+    _ensure_database_store_table_unlocked()
+    payload = json.dumps(store, ensure_ascii=False)
+    with _connect_database() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                insert into app_runtime_store (id, payload, updated_at)
+                values (%s, %s::jsonb, now())
+                on conflict (id)
+                do update set payload = excluded.payload, updated_at = excluded.updated_at
+                """,
+                (_DATABASE_STORE_ID, payload),
+            )
+        connection.commit()
+
+
+def _read_store_from_database_unlocked() -> Store:
+    _ensure_database_store_table_unlocked()
+    with _connect_database() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "select payload::text from app_runtime_store where id = %s",
+                (_DATABASE_STORE_ID,),
+            )
+            row = cursor.fetchone()
+
+    if not row or not row[0]:
+        store = deepcopy(INITIAL_STORE)
+        _write_store_to_database_unlocked(store)
+        return store
+
+    try:
+        parsed = json.loads(row[0])
+    except json.JSONDecodeError:
+        store = deepcopy(INITIAL_STORE)
+        _write_store_to_database_unlocked(store)
+        return store
+
+    store = _normalize_store_shape(parsed)
+    if store.keys() != parsed.keys():
+        _write_store_to_database_unlocked(store)
+    return store
+
+
+def _write_store_unlocked(store: Store) -> None:
+    if _use_database_store():
+        _write_store_to_database_unlocked(store)
+        return
+
+    settings.store_file.parent.mkdir(parents=True, exist_ok=True)
     settings.store_file.write_text(
-        # ensure_ascii=False：让中文直接写入，不转成 \\uXXXX
-        # indent=2：格式化 JSON，缩进 2 个空格，便于人工查看
         json.dumps(store, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
 
-async def read_store() -> dict[str, list[dict[str, Any]]]:
-    """
-    读取整个 JSON 存储，并返回 Python 字典。
+def _read_store_unlocked() -> Store:
+    if _use_database_store():
+        return _read_store_from_database_unlocked()
 
-    具备以下保护逻辑：
-    1. 自动确保文件存在
-    2. 自动处理空文件
-    3. 自动处理 BOM
-    4. 如果 JSON 损坏，则重置为初始结构
+    settings.store_file.parent.mkdir(parents=True, exist_ok=True)
 
-    返回值始终是一个合法的 store 字典结构。
-    """
-    async with _store_lock:
-        # 确保存储文件已经存在
-        await ensure_store()
-
-        # 读取原始文本
-        raw = settings.store_file.read_text(encoding="utf-8")
-
-        # 清理 BOM 和首尾空白
-        normalized = _normalize_json(raw)
-
-        # 如果文件是空的，直接重置为初始结构并返回
-        if not normalized:
-            _write_store_unlocked(deepcopy(INITIAL_STORE))
-            return deepcopy(INITIAL_STORE)
-
-        try:
-            # 尝试把 JSON 字符串解析成 Python 字典
-            return json.loads(normalized)
-        except json.JSONDecodeError:
-            # 如果文件内容不是合法 JSON，则直接重置
-            # 这是一个“容错优先”的设计：宁可清空也不让程序崩掉
-            _write_store_unlocked(deepcopy(INITIAL_STORE))
-            return deepcopy(INITIAL_STORE)
-
-
-async def write_store(store: dict[str, list[dict[str, Any]]]) -> None:
-    """
-    安全地把整个 store 写回 JSON 文件。
-
-    和 _write_store_unlocked 的区别：
-    - 这个函数会先加锁
-    - 更适合作为对外统一写入入口
-    """
-    async with _store_lock:
+    if not settings.store_file.exists():
+        store = deepcopy(INITIAL_STORE)
         _write_store_unlocked(store)
+        return store
+
+    raw = settings.store_file.read_text(encoding="utf-8")
+    normalized = _normalize_json(raw)
+    if not normalized:
+        store = deepcopy(INITIAL_STORE)
+        _write_store_unlocked(store)
+        return store
+
+    try:
+        parsed = json.loads(normalized)
+    except json.JSONDecodeError:
+        store = deepcopy(INITIAL_STORE)
+        _write_store_unlocked(store)
+        return store
+
+    store = _normalize_store_shape(parsed)
+    if store.keys() != parsed.keys():
+        _write_store_unlocked(store)
+    return store
+
+
+async def ensure_store() -> None:
+    async with _store_lock:
+        _read_store_unlocked()
+
+
+async def read_store() -> Store:
+    async with _store_lock:
+        return deepcopy(_read_store_unlocked())
+
+
+async def _mutate_store(mutator: StoreMutator) -> Any:
+    async with _store_lock:
+        store = _read_store_unlocked()
+        result = mutator(store)
+        _write_store_unlocked(store)
+        return deepcopy(result)
 
 
 def _sorted_desc(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    按更新时间倒序排序记录。
-
-    排序优先级：
-    1. updatedAt
-    2. createdAt
-    3. 空字符串（兜底）
-
-    reverse=True 表示降序，也就是“最新的排前面”。
-    """
     return sorted(
         items,
         key=lambda item: item.get("updatedAt") or item.get("createdAt") or "",
@@ -169,85 +204,290 @@ def _sorted_desc(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
-async def list_conversations_by_user(user_id: str) -> list[dict[str, Any]]:
-    """
-    获取某个用户的所有会话，并按最近更新时间倒序返回。
-    """
-    store = await read_store()
+def _dt(value: str | None) -> datetime:
+    if not value:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+    return datetime.fromisoformat(value)
 
-    # 只筛选出 userId 匹配的会话
+
+def _next_sequence(
+    items: list[dict[str, Any]],
+    *,
+    field: str,
+    value: str,
+    sequence_key: str = "sequence",
+) -> int:
+    sequences = [
+        int(item.get(sequence_key, 0))
+        for item in items
+        if item.get(field) == value and isinstance(item.get(sequence_key, 0), int)
+    ]
+    return max(sequences, default=0) + 1
+
+
+def _trim_text(value: Any, limit: int = 6000) -> str:
+    text = "" if value is None else str(value)
+    return text[:limit]
+
+
+def _slugify(value: str) -> str:
+    lowered = value.strip().lower()
+    lowered = re.sub(r"[^a-z0-9]+", "-", lowered)
+    lowered = re.sub(r"-{2,}", "-", lowered).strip("-")
+    return lowered or f"workspace-{uuid.uuid4().hex[:8]}"
+
+
+def _workspace_match(item: dict[str, Any], workspace_id: str | None) -> bool:
+    return workspace_id is None or item.get("workspaceId") == workspace_id
+
+
+def _hydrate_legacy_workspace_records(
+    store: Store, *, user_id: str, workspace_id: str
+) -> None:
+    scoped_tables = [
+        "conversations",
+        "messages",
+        "agentRuns",
+        "agentSteps",
+        "toolCallLogs",
+        "runEvents",
+        "documents",
+        "backgroundJobs",
+        "auditLogs",
+    ]
+    for table in scoped_tables:
+        for item in store.get(table, []):
+            if item.get("userId") == user_id and not item.get("workspaceId"):
+                item["workspaceId"] = workspace_id
+
+
+async def ensure_default_workspace_for_user(
+    user_id: str, *, workspace_name: str | None = None
+) -> dict[str, Any]:
+    now = _now()
+    default_name = workspace_name or "My Workspace"
+
+    def mutator(store: Store) -> dict[str, Any]:
+        membership = next(
+            (item for item in store["workspaceMembers"] if item["userId"] == user_id),
+            None,
+        )
+        if membership:
+            workspace = next(
+                (
+                    item
+                    for item in store["workspaces"]
+                    if item["id"] == membership["workspaceId"]
+                ),
+                None,
+            )
+            if workspace:
+                _hydrate_legacy_workspace_records(
+                    store, user_id=user_id, workspace_id=workspace["id"]
+                )
+                return {
+                    **workspace,
+                    "currentRole": membership["role"],
+                    "memberCount": len(
+                        [
+                            item
+                            for item in store["workspaceMembers"]
+                            if item["workspaceId"] == workspace["id"]
+                        ]
+                    ),
+                }
+
+        workspace = {
+            "id": str(uuid.uuid4()),
+            "name": default_name,
+            "slug": _slugify(f"{default_name}-{user_id[:8]}"),
+            "ownerUserId": user_id,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        member = {
+            "id": str(uuid.uuid4()),
+            "workspaceId": workspace["id"],
+            "userId": user_id,
+            "role": "owner",
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["workspaces"].append(workspace)
+        store["workspaceMembers"].append(member)
+        _hydrate_legacy_workspace_records(store, user_id=user_id, workspace_id=workspace["id"])
+        return {**workspace, "currentRole": "owner", "memberCount": 1}
+
+    return await _mutate_store(mutator)
+
+
+async def create_workspace(user_id: str, name: str) -> dict[str, Any]:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any]:
+        workspace = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "slug": _slugify(name),
+            "ownerUserId": user_id,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        member = {
+            "id": str(uuid.uuid4()),
+            "workspaceId": workspace["id"],
+            "userId": user_id,
+            "role": "owner",
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["workspaces"].append(workspace)
+        store["workspaceMembers"].append(member)
+        return {**workspace, "currentRole": "owner", "memberCount": 1}
+
+    return await _mutate_store(mutator)
+
+
+async def list_workspaces_by_user(user_id: str) -> list[dict[str, Any]]:
+    store = await read_store()
+    memberships = [
+        item for item in store["workspaceMembers"] if item["userId"] == user_id
+    ]
+    items: list[dict[str, Any]] = []
+    for membership in memberships:
+        workspace = next(
+            (
+                item
+                for item in store["workspaces"]
+                if item["id"] == membership["workspaceId"]
+            ),
+            None,
+        )
+        if not workspace:
+            continue
+        items.append(
+            {
+                **workspace,
+                "currentRole": membership["role"],
+                "memberCount": len(
+                    [
+                        item
+                        for item in store["workspaceMembers"]
+                        if item["workspaceId"] == workspace["id"]
+                    ]
+                ),
+            }
+        )
+    return _sorted_desc(items)
+
+
+async def get_workspace_by_id(
+    workspace_id: str, user_id: str
+) -> dict[str, Any] | None:
+    store = await read_store()
+    membership = next(
+        (
+            item
+            for item in store["workspaceMembers"]
+            if item["workspaceId"] == workspace_id and item["userId"] == user_id
+        ),
+        None,
+    )
+    if not membership:
+        return None
+
+    workspace = next(
+        (item for item in store["workspaces"] if item["id"] == workspace_id),
+        None,
+    )
+    if not workspace:
+        return None
+
+    return {
+        **workspace,
+        "currentRole": membership["role"],
+        "memberCount": len(
+            [
+                item
+                for item in store["workspaceMembers"]
+                if item["workspaceId"] == workspace_id
+            ]
+        ),
+    }
+
+
+async def get_user_role_in_workspace(workspace_id: str, user_id: str) -> str | None:
+    store = await read_store()
+    membership = next(
+        (
+            item
+            for item in store["workspaceMembers"]
+            if item["workspaceId"] == workspace_id and item["userId"] == user_id
+        ),
+        None,
+    )
+    return membership["role"] if membership else None
+
+
+async def list_conversations_by_user(
+    user_id: str, workspace_id: str | None = None
+) -> list[dict[str, Any]]:
+    store = await read_store()
     return _sorted_desc(
-        [item for item in store["conversations"] if item["userId"] == user_id]
+        [
+            item
+            for item in store["conversations"]
+            if item["userId"] == user_id and _workspace_match(item, workspace_id)
+        ]
     )
 
 
-async def create_conversation(user_id: str, title: str = "新的任务") -> dict[str, Any]:
-    """
-    创建一个新的会话记录。
-
-    参数：
-    - user_id：所属用户 ID
-    - title：会话标题，默认是“新的任务”
-
-    返回：
-    - 新创建的会话字典
-    """
-    store = await read_store()
+async def create_conversation(
+    user_id: str,
+    title: str = "新的任务",
+    *,
+    workspace_id: str | None = None,
+) -> dict[str, Any]:
     now = _now()
 
-    # 构造一条新的会话记录
-    conversation = {
-        "id": str(uuid.uuid4()),  # 会话唯一 ID
-        "userId": user_id,        # 所属用户
-        "title": title,           # 会话标题
-        "createdAt": now,         # 创建时间
-        "updatedAt": now,         # 更新时间
-    }
+    def mutator(store: Store) -> dict[str, Any]:
+        conversation = {
+            "id": str(uuid.uuid4()),
+            "userId": user_id,
+            "workspaceId": workspace_id,
+            "title": title,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["conversations"].append(conversation)
+        return conversation
 
-    # 追加到 conversations 表
-    store["conversations"].append(conversation)
-
-    # 写回文件
-    await write_store(store)
-
-    return conversation
+    return await _mutate_store(mutator)
 
 
 async def get_conversation_by_id(
-    conversation_id: str, user_id: str
+    conversation_id: str, user_id: str, workspace_id: str | None = None
 ) -> dict[str, Any] | None:
-    """
-    根据会话 ID + 用户 ID 获取单个会话详情。
-
-    额外返回：
-    - 该会话下的 messages
-    - 该会话下的 documents
-
-    如果没找到，返回 None。
-    """
     store = await read_store()
-
-    # 只允许获取当前用户自己的会话，避免越权读取
     conversation = next(
         (
             item
             for item in store["conversations"]
-            if item["id"] == conversation_id and item["userId"] == user_id
+            if item["id"] == conversation_id
+            and item["userId"] == user_id
+            and _workspace_match(item, workspace_id)
         ),
         None,
     )
-
     if not conversation:
         return None
 
-    # 返回时，把原 conversation 展开，
-    # 再附带该会话关联的 messages 和 documents
     return {
         **conversation,
         "messages": [
             item
             for item in store["messages"]
-            if item["conversationId"] == conversation_id
+            if item["conversationId"] == conversation_id and _workspace_match(item, workspace_id)
         ],
         "documents": _sorted_desc(
             [
@@ -255,6 +495,16 @@ async def get_conversation_by_id(
                 for item in store["documents"]
                 if item["conversationId"] == conversation_id
                 and item["userId"] == user_id
+                and _workspace_match(item, workspace_id)
+            ]
+        ),
+        "runs": _sorted_desc(
+            [
+                item
+                for item in store["agentRuns"]
+                if item["conversationId"] == conversation_id
+                and item["userId"] == user_id
+                and _workspace_match(item, workspace_id)
             ]
         ),
     }
@@ -266,324 +516,894 @@ async def append_message(
     role: str,
     content: str,
     metadata: dict[str, Any] | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
-    """
-    向某个会话中追加一条消息。
-
-    参数：
-    - conversation_id：所属会话 ID
-    - user_id：所属用户 ID
-    - role：消息角色，例如 'user' / 'assistant' / 'system'
-    - content：消息文本内容
-    - metadata：附加元数据，可选
-
-    额外逻辑：
-    - 会更新会话的 updatedAt
-    - 如果是用户发的第一条有效消息，且会话标题还是默认“新的任务”，
-      则自动把标题改成消息前 30 个字符
-    """
-    store = await read_store()
     now = _now()
 
-    # 构造消息记录
-    message = {
-        "id": str(uuid.uuid4()),          # 消息唯一 ID
-        "conversationId": conversation_id, # 所属会话
-        "userId": user_id,                # 所属用户
-        "role": role,                     # 角色
-        "content": content,               # 文本内容
-        "metadata": metadata or {},       # 没传 metadata 时默认空字典
-        "createdAt": now,                 # 创建时间
-        "updatedAt": now,                 # 更新时间
-    }
+    def mutator(store: Store) -> dict[str, Any]:
+        resolved_workspace_id = workspace_id
+        if resolved_workspace_id is None:
+            conversation = next(
+                (item for item in store["conversations"] if item["id"] == conversation_id),
+                None,
+            )
+            resolved_workspace_id = conversation.get("workspaceId") if conversation else None
 
-    # 追加到 messages 表
-    store["messages"].append(message)
+        message = {
+            "id": str(uuid.uuid4()),
+            "conversationId": conversation_id,
+            "userId": user_id,
+            "workspaceId": resolved_workspace_id,
+            "role": role,
+            "content": content,
+            "metadata": metadata or {},
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["messages"].append(message)
 
-    # 顺便更新对应会话的更新时间
-    for conversation in store["conversations"]:
-        if conversation["id"] == conversation_id:
+        for conversation in store["conversations"]:
+            if conversation["id"] != conversation_id:
+                continue
             conversation["updatedAt"] = now
-
-            # 如果满足以下条件，则自动用用户输入生成标题：
-            # 1. 当前消息角色是 user
-            # 2. 内容去掉空白后不为空
-            # 3. 当前标题还是默认“新的任务”
             if role == "user" and content.strip() and conversation["title"] == "新的任务":
                 conversation["title"] = content[:30]
             break
 
-    await write_store(store)
-    return message
+        return message
+
+    return await _mutate_store(mutator)
 
 
 async def create_agent_run(
-    conversation_id: str, user_id: str, prompt: str
+    conversation_id: str,
+    user_id: str,
+    prompt: str,
+    metadata: dict[str, Any] | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
-    """
-    创建一条智能体执行记录（agent run）。
-
-    用于记录一次 agent/助手任务的运行过程。
-    """
-    store = await read_store()
     now = _now()
 
-    run = {
-        "id": str(uuid.uuid4()),   # 运行记录 ID
-        "conversationId": conversation_id,  # 所属会话
-        "userId": user_id,         # 所属用户
-        "prompt": prompt,          # 本次运行对应的 prompt
-        "status": "running",       # 初始状态：运行中
-        "toolCalls": [],           # 运行期间调用过的工具列表
-        "memoryContext": "",       # 运行时记忆上下文
-        "result": "",              # 最终结果
-        "createdAt": now,
-        "updatedAt": now,
-    }
+    def mutator(store: Store) -> dict[str, Any]:
+        resolved_workspace_id = workspace_id
+        if resolved_workspace_id is None:
+            conversation = next(
+                (item for item in store["conversations"] if item["id"] == conversation_id),
+                None,
+            )
+            resolved_workspace_id = conversation.get("workspaceId") if conversation else None
 
-    store["agentRuns"].append(run)
-    await write_store(store)
-    return run
+        run = {
+            "id": str(uuid.uuid4()),
+            "conversationId": conversation_id,
+            "userId": user_id,
+            "workspaceId": resolved_workspace_id,
+            "prompt": prompt,
+            "status": "running",
+            "toolCalls": [],
+            "memoryContext": "",
+            "memorySource": "",
+            "result": "",
+            "structuredOutput": None,
+            "promptVersion": metadata.get("promptVersion") if metadata else None,
+            "modelUsage": None,
+            "metadata": metadata or {},
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["agentRuns"].append(run)
+        return run
+
+    return await _mutate_store(mutator)
 
 
 async def update_agent_run(run_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
-    """
-    更新一条智能体运行记录。
+    now = _now()
 
-    参数：
-    - run_id：要更新的运行记录 ID
-    - updates：要合并进去的字段字典
+    def mutator(store: Store) -> dict[str, Any] | None:
+        run = next((item for item in store["agentRuns"] if item["id"] == run_id), None)
+        if not run:
+            return None
 
-    返回：
-    - 更新后的 run
-    - 如果找不到则返回 None
-    """
+        run.update(updates)
+        run["updatedAt"] = now
+        return run
+
+    return await _mutate_store(mutator)
+
+
+async def list_agent_runs_by_user(
+    user_id: str, workspace_id: str | None = None
+) -> list[dict[str, Any]]:
     store = await read_store()
+    return _sorted_desc(
+        [
+            item
+            for item in store["agentRuns"]
+            if item["userId"] == user_id and _workspace_match(item, workspace_id)
+        ]
+    )
 
-    # 找到目标 run
-    run = next((item for item in store["agentRuns"] if item["id"] == run_id), None)
+
+async def get_agent_run_by_id(
+    run_id: str, user_id: str, workspace_id: str | None = None
+) -> dict[str, Any] | None:
+    store = await read_store()
+    run = next(
+        (
+            item
+            for item in store["agentRuns"]
+            if item["id"] == run_id
+            and item["userId"] == user_id
+            and _workspace_match(item, workspace_id)
+        ),
+        None,
+    )
     if not run:
         return None
 
-    # 合并更新字段
-    run.update(updates)
+    return {
+        **run,
+        "steps": sorted(
+            [item for item in store["agentSteps"] if item["runId"] == run_id],
+            key=lambda item: item.get("sequence", 0),
+        ),
+        "toolLogs": _sorted_desc(
+            [item for item in store["toolCallLogs"] if item["runId"] == run_id]
+        ),
+        "events": sorted(
+            [item for item in store["runEvents"] if item["runId"] == run_id],
+            key=lambda item: item.get("sequence", 0),
+        ),
+        "usage": _sorted_desc(
+            [item for item in store["modelUsageLogs"] if item["runId"] == run_id]
+        ),
+    }
 
-    # 刷新更新时间
-    run["updatedAt"] = _now()
 
-    await write_store(store)
-    return run
+async def create_agent_step(
+    run_id: str,
+    user_id: str,
+    conversation_id: str,
+    name: str,
+    *,
+    workspace_id: str | None = None,
+    status: str = "running",
+    input_data: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any]:
+        resolved_workspace_id = workspace_id
+        if resolved_workspace_id is None:
+            run = next((item for item in store["agentRuns"] if item["id"] == run_id), None)
+            resolved_workspace_id = run.get("workspaceId") if run else None
+
+        step = {
+            "id": str(uuid.uuid4()),
+            "runId": run_id,
+            "userId": user_id,
+            "conversationId": conversation_id,
+            "workspaceId": resolved_workspace_id,
+            "name": name,
+            "sequence": _next_sequence(store["agentSteps"], field="runId", value=run_id),
+            "status": status,
+            "input": input_data or {},
+            "output": None,
+            "error": None,
+            "metadata": metadata or {},
+            "startedAt": now,
+            "completedAt": None,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["agentSteps"].append(step)
+        return step
+
+    return await _mutate_store(mutator)
+
+
+async def update_agent_step(step_id: str, updates: dict[str, Any]) -> dict[str, Any] | None:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any] | None:
+        step = next((item for item in store["agentSteps"] if item["id"] == step_id), None)
+        if not step:
+            return None
+
+        step.update(updates)
+        step["updatedAt"] = now
+        if updates.get("status") in {"completed", "failed", "skipped"}:
+            step["completedAt"] = now
+        return step
+
+    return await _mutate_store(mutator)
+
+
+async def list_agent_steps_by_run(run_id: str) -> list[dict[str, Any]]:
+    store = await read_store()
+    return sorted(
+        [item for item in store["agentSteps"] if item["runId"] == run_id],
+        key=lambda item: item.get("sequence", 0),
+    )
+
+
+async def create_run_event(
+    run_id: str,
+    user_id: str,
+    conversation_id: str,
+    event_type: str,
+    workspace_id: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any]:
+        resolved_workspace_id = workspace_id
+        if resolved_workspace_id is None:
+            run = next((item for item in store["agentRuns"] if item["id"] == run_id), None)
+            resolved_workspace_id = run.get("workspaceId") if run else None
+
+        event = {
+            "id": str(uuid.uuid4()),
+            "runId": run_id,
+            "userId": user_id,
+            "conversationId": conversation_id,
+            "workspaceId": resolved_workspace_id,
+            "type": event_type,
+            "sequence": _next_sequence(store["runEvents"], field="runId", value=run_id),
+            "payload": payload or {},
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["runEvents"].append(event)
+        return event
+
+    return await _mutate_store(mutator)
+
+
+async def list_run_events_by_run(run_id: str) -> list[dict[str, Any]]:
+    store = await read_store()
+    return sorted(
+        [item for item in store["runEvents"] if item["runId"] == run_id],
+        key=lambda item: item.get("sequence", 0),
+    )
+
+
+async def create_tool_call_log(
+    run_id: str,
+    conversation_id: str,
+    user_id: str,
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    workspace_id: str | None = None,
+    status: str = "completed",
+    result: Any = None,
+    error: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any]:
+        resolved_workspace_id = workspace_id
+        if resolved_workspace_id is None:
+            run = next((item for item in store["agentRuns"] if item["id"] == run_id), None)
+            resolved_workspace_id = run.get("workspaceId") if run else None
+
+        tool_call = {
+            "id": str(uuid.uuid4()),
+            "runId": run_id,
+            "conversationId": conversation_id,
+            "userId": user_id,
+            "workspaceId": resolved_workspace_id,
+            "name": name,
+            "arguments": arguments,
+            "status": status,
+            "result": result,
+            "error": error,
+            "metadata": metadata or {},
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["toolCallLogs"].append(tool_call)
+        return tool_call
+
+    return await _mutate_store(mutator)
+
+
+async def list_tool_call_logs_by_user(
+    user_id: str, workspace_id: str | None = None
+) -> list[dict[str, Any]]:
+    store = await read_store()
+    return _sorted_desc(
+        [
+            item
+            for item in store["toolCallLogs"]
+            if item["userId"] == user_id and _workspace_match(item, workspace_id)
+        ]
+    )
+
+
+async def list_tool_call_logs_by_run(run_id: str) -> list[dict[str, Any]]:
+    store = await read_store()
+    return _sorted_desc([item for item in store["toolCallLogs"] if item["runId"] == run_id])
 
 
 async def create_document(record: dict[str, Any]) -> dict[str, Any]:
-    """
-    创建一条文档记录。
-
-    record 参数允许调用方传入额外字段，例如：
-    - userId
-    - conversationId
-    - filename
-    - mimeType
-    - path
-    等等
-
-    注意：
-    **record 放在最后展开，因此如果 record 中包含同名字段，
-    会覆盖这里提供的默认值。**
-    """
-    store = await read_store()
     now = _now()
 
-    document = {
-        "id": str(uuid.uuid4()),   # 文档 ID
-        "status": "queued",        # 默认状态：排队中
-        "summary": "",             # 文档摘要
-        "extractedText": "",       # 文档提取文本
-        "createdAt": now,
-        "updatedAt": now,
-        **record,                  # 调用方传入的字段覆盖默认值
-    }
+    def mutator(store: Store) -> dict[str, Any]:
+        document = {
+            "id": str(uuid.uuid4()),
+            "status": "queued",
+            "summary": "",
+            "extractedText": "",
+            "createdAt": now,
+            "updatedAt": now,
+            **record,
+        }
+        store["documents"].append(document)
+        return document
 
-    store["documents"].append(document)
-    await write_store(store)
-    return document
+    return await _mutate_store(mutator)
 
 
 async def update_document(
     document_id: str, updates: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """
-    更新一条文档记录。
+    now = _now()
 
-    找不到对应 document 时返回 None。
-    """
-    store = await read_store()
+    def mutator(store: Store) -> dict[str, Any] | None:
+        document = next(
+            (item for item in store["documents"] if item["id"] == document_id),
+            None,
+        )
+        if not document:
+            return None
 
-    document = next(
-        (item for item in store["documents"] if item["id"] == document_id), None
-    )
-    if not document:
-        return None
+        document.update(updates)
+        document["updatedAt"] = now
+        return document
 
-    # 更新字段
-    document.update(updates)
-
-    # 刷新更新时间
-    document["updatedAt"] = _now()
-
-    await write_store(store)
-    return document
+    return await _mutate_store(mutator)
 
 
 async def get_document_by_id(
-    document_id: str, user_id: str
+    document_id: str, user_id: str, workspace_id: str | None = None
 ) -> dict[str, Any] | None:
-    """
-    根据 document_id + user_id 获取某个文档。
-
-    只允许读取当前用户自己的文档。
-    """
     store = await read_store()
-
     return next(
         (
             item
             for item in store["documents"]
-            if item["id"] == document_id and item["userId"] == user_id
+            if item["id"] == document_id
+            and item["userId"] == user_id
+            and _workspace_match(item, workspace_id)
         ),
         None,
     )
 
 
-async def list_documents_by_user(user_id: str) -> list[dict[str, Any]]:
-    """
-    获取某个用户的全部文档，并按时间倒序返回。
-    """
+async def list_documents_by_user(
+    user_id: str, workspace_id: str | None = None
+) -> list[dict[str, Any]]:
     store = await read_store()
     return _sorted_desc(
-        [item for item in store["documents"] if item["userId"] == user_id]
+        [
+            item
+            for item in store["documents"]
+            if item["userId"] == user_id and _workspace_match(item, workspace_id)
+        ]
     )
 
 
 async def create_background_job(record: dict[str, Any]) -> dict[str, Any]:
-    """
-    创建一条后台任务记录。
-
-    record 可由调用方传入额外字段，例如：
-    - userId
-    - type
-    - payload
-    - conversationId
-    等
-    """
-    store = await read_store()
     now = _now()
 
-    job = {
-        "id": str(uuid.uuid4()),   # 任务 ID
-        "status": "queued",        # 默认状态：排队中
-        "output": None,            # 任务输出
-        "error": None,             # 错误信息
-        "createdAt": now,
-        "updatedAt": now,
-        **record,                  # 调用方字段覆盖默认值
-    }
+    def mutator(store: Store) -> dict[str, Any]:
+        job = {
+            "id": str(uuid.uuid4()),
+            "status": "queued",
+            "output": None,
+            "error": None,
+            "attemptCount": 0,
+            "createdAt": now,
+            "updatedAt": now,
+            **record,
+        }
+        store["backgroundJobs"].append(job)
+        return job
 
-    store["backgroundJobs"].append(job)
-    await write_store(store)
-    return job
+    return await _mutate_store(mutator)
 
 
 async def update_background_job(
     job_id: str, updates: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """
-    更新一条后台任务记录。
+    now = _now()
 
-    找不到时返回 None。
-    """
+    def mutator(store: Store) -> dict[str, Any] | None:
+        job = next((item for item in store["backgroundJobs"] if item["id"] == job_id), None)
+        if not job:
+            return None
+
+        job.update(updates)
+        job["updatedAt"] = now
+        return job
+
+    return await _mutate_store(mutator)
+
+
+async def get_background_job_by_id(
+    job_id: str, user_id: str, workspace_id: str | None = None
+) -> dict[str, Any] | None:
     store = await read_store()
-
-    job = next(
-        (item for item in store["backgroundJobs"] if item["id"] == job_id), None
+    return next(
+        (
+            item
+            for item in store["backgroundJobs"]
+            if item["id"] == job_id
+            and item["userId"] == user_id
+            and _workspace_match(item, workspace_id)
+        ),
+        None,
     )
-    if not job:
-        return None
-
-    # 合并更新字段
-    job.update(updates)
-
-    # 更新时间
-    job["updatedAt"] = _now()
-
-    await write_store(store)
-    return job
 
 
-async def list_background_jobs_by_user(user_id: str) -> list[dict[str, Any]]:
-    """
-    获取某个用户的所有后台任务，并按时间倒序返回。
-    """
+async def list_background_jobs_by_user(
+    user_id: str, workspace_id: str | None = None
+) -> list[dict[str, Any]]:
     store = await read_store()
     return _sorted_desc(
-        [item for item in store["backgroundJobs"] if item["userId"] == user_id]
+        [
+            item
+            for item in store["backgroundJobs"]
+            if item["userId"] == user_id and _workspace_match(item, workspace_id)
+        ]
     )
 
 
 async def upsert_preference(
     user_id: str, key: str, value: str, source: str = "app"
-) -> None:
-    """
-    新增或更新用户偏好（upsert = update + insert）。
-
-    逻辑：
-    - 如果该用户已存在相同 key 的偏好，则更新 value/source/updatedAt
-    - 如果不存在，则新建一条偏好记录
-
-    参数：
-    - user_id：用户 ID
-    - key：偏好项名称，例如 'theme'
-    - value：偏好值，例如 'dark'
-    - source：来源，默认 'app'
-    """
-    store = await read_store()
+) -> dict[str, Any]:
     now = _now()
 
-    # 查找该用户是否已经存在相同 key 的偏好记录
-    existing = next(
-        (
+    def mutator(store: Store) -> dict[str, Any]:
+        existing = next(
+            (
+                item
+                for item in store["userPreferences"]
+                if item["userId"] == user_id and item["key"] == key
+            ),
+            None,
+        )
+        if existing:
+            existing.update({"value": value, "source": source, "updatedAt": now})
+            return existing
+
+        preference = {
+            "id": str(uuid.uuid4()),
+            "userId": user_id,
+            "key": key,
+            "value": value,
+            "source": source,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["userPreferences"].append(preference)
+        return preference
+
+    return await _mutate_store(mutator)
+
+
+async def delete_preference(preference_id: str, user_id: str) -> bool:
+    def mutator(store: Store) -> bool:
+        before = len(store["userPreferences"])
+        store["userPreferences"] = [
             item
             for item in store["userPreferences"]
-            if item["userId"] == user_id and item["key"] == key
-        ),
-        None,
-    )
+            if not (item["id"] == preference_id and item["userId"] == user_id)
+        ]
+        return len(store["userPreferences"]) != before
 
-    if existing:
-        # 已存在：更新值
-        existing.update({"value": value, "source": source, "updatedAt": now})
-    else:
-        # 不存在：新增一条记录
-        store["userPreferences"].append(
-            {
-                "id": str(uuid.uuid4()),
-                "userId": user_id,
-                "key": key,
-                "value": value,
-                "source": source,
-                "createdAt": now,
-                "updatedAt": now,
-            }
-        )
-
-    await write_store(store)
+    return bool(await _mutate_store(mutator))
 
 
 async def list_preferences_by_user(user_id: str) -> list[dict[str, Any]]:
-    """
-    获取某个用户的全部偏好设置，并按时间倒序返回。
-    """
     store = await read_store()
     return _sorted_desc(
         [item for item in store["userPreferences"] if item["userId"] == user_id]
+    )
+
+
+async def create_memory_writeback(
+    user_id: str,
+    *,
+    conversation_id: str | None,
+    source: str,
+    summary: str,
+    items: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any]:
+        writeback = {
+            "id": str(uuid.uuid4()),
+            "userId": user_id,
+            "conversationId": conversation_id,
+            "source": source,
+            "summary": _trim_text(summary, limit=2000),
+            "items": items or [],
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["memoryWritebacks"].append(writeback)
+        return writeback
+
+    return await _mutate_store(mutator)
+
+
+async def list_memory_writebacks_by_user(user_id: str) -> list[dict[str, Any]]:
+    store = await read_store()
+    return _sorted_desc(
+        [item for item in store["memoryWritebacks"] if item["userId"] == user_id]
+    )
+
+
+async def create_audit_log(
+    user_id: str,
+    action: str,
+    resource_type: str,
+    *,
+    workspace_id: str | None = None,
+    resource_id: str | None = None,
+    status: str = "success",
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any]:
+        record = {
+            "id": str(uuid.uuid4()),
+            "userId": user_id,
+            "workspaceId": workspace_id,
+            "action": action,
+            "resourceType": resource_type,
+            "resourceId": resource_id,
+            "status": status,
+            "detail": detail or {},
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["auditLogs"].append(record)
+        return record
+
+    return await _mutate_store(mutator)
+
+
+async def list_audit_logs_by_user(
+    user_id: str, *, workspace_id: str | None = None, limit: int = 50
+) -> list[dict[str, Any]]:
+    store = await read_store()
+    return _sorted_desc(
+        [
+            item
+            for item in store["auditLogs"]
+            if item["userId"] == user_id and _workspace_match(item, workspace_id)
+        ]
+    )[:limit]
+
+
+async def create_model_usage_log(
+    run_id: str,
+    user_id: str,
+    conversation_id: str,
+    *,
+    model: str,
+    provider: str,
+    stage: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    total_tokens: int = 0,
+    estimated_cost: float = 0.0,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any]:
+        usage = {
+            "id": str(uuid.uuid4()),
+            "runId": run_id,
+            "userId": user_id,
+            "conversationId": conversation_id,
+            "model": model,
+            "provider": provider,
+            "stage": stage,
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "totalTokens": total_tokens,
+            "estimatedCost": estimated_cost,
+            "metadata": metadata or {},
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["modelUsageLogs"].append(usage)
+        return usage
+
+    return await _mutate_store(mutator)
+
+
+async def list_model_usage_logs_by_run(run_id: str) -> list[dict[str, Any]]:
+    store = await read_store()
+    return _sorted_desc([item for item in store["modelUsageLogs"] if item["runId"] == run_id])
+
+
+async def record_rate_limit_event(
+    user_id: str,
+    scope: str,
+    *,
+    allowed: bool,
+    limit: int,
+    window_seconds: int,
+    count_in_window: int,
+) -> dict[str, Any]:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any]:
+        event = {
+            "id": str(uuid.uuid4()),
+            "userId": user_id,
+            "scope": scope,
+            "allowed": allowed,
+            "limit": limit,
+            "windowSeconds": window_seconds,
+            "countInWindow": count_in_window,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["rateLimitEvents"].append(event)
+        return event
+
+    return await _mutate_store(mutator)
+
+
+async def check_rate_limit(
+    user_id: str,
+    scope: str,
+    *,
+    limit: int,
+    window_seconds: int,
+) -> dict[str, Any]:
+    store = await read_store()
+    threshold = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+    recent = [
+        item
+        for item in store["rateLimitEvents"]
+        if item.get("userId") == user_id
+        and item.get("scope") == scope
+        and item.get("allowed") is True
+        and _dt(item.get("createdAt")) >= threshold
+    ]
+
+    count_in_window = len(recent)
+    allowed = count_in_window < limit
+    await record_rate_limit_event(
+        user_id,
+        scope,
+        allowed=allowed,
+        limit=limit,
+        window_seconds=window_seconds,
+        count_in_window=count_in_window + (1 if allowed else 0),
+    )
+    return {
+        "allowed": allowed,
+        "countInWindow": count_in_window,
+        "remaining": max(limit - count_in_window - (1 if allowed else 0), 0),
+        "retryAfterSeconds": 0 if allowed else window_seconds,
+    }
+
+
+async def upsert_prompt_version(
+    key: str,
+    version: str,
+    content: str,
+    *,
+    is_active: bool = True,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any]:
+        existing = next(
+            (
+                item
+                for item in store["promptVersions"]
+                if item["key"] == key and item["version"] == version
+            ),
+            None,
+        )
+        if existing:
+            existing.update(
+                {
+                    "content": content,
+                    "isActive": is_active,
+                    "metadata": metadata or existing.get("metadata", {}),
+                    "updatedAt": now,
+                }
+            )
+            return existing
+
+        prompt_version = {
+            "id": str(uuid.uuid4()),
+            "key": key,
+            "version": version,
+            "content": content,
+            "isActive": is_active,
+            "metadata": metadata or {},
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["promptVersions"].append(prompt_version)
+        return prompt_version
+
+    return await _mutate_store(mutator)
+
+
+async def get_prompt_version(key: str, version: str | None = None) -> dict[str, Any] | None:
+    store = await read_store()
+    matches = [item for item in store["promptVersions"] if item["key"] == key]
+    if version is not None:
+        return next((item for item in matches if item["version"] == version), None)
+
+    active_matches = [item for item in matches if item.get("isActive")]
+    if active_matches:
+        return _sorted_desc(active_matches)[0]
+    return _sorted_desc(matches)[0] if matches else None
+
+
+async def list_prompt_versions(key: str | None = None) -> list[dict[str, Any]]:
+    store = await read_store()
+    items = store["promptVersions"]
+    if key is not None:
+        items = [item for item in items if item["key"] == key]
+    return _sorted_desc(items)
+
+
+async def upsert_mcp_server(
+    name: str,
+    *,
+    transport: str,
+    status: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any]:
+        existing = next((item for item in store["mcpServers"] if item["name"] == name), None)
+        if existing:
+            existing.update(
+                {
+                    "transport": transport,
+                    "status": status,
+                    "metadata": metadata or existing.get("metadata", {}),
+                    "updatedAt": now,
+                }
+            )
+            return existing
+
+        record = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "transport": transport,
+            "status": status,
+            "metadata": metadata or {},
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["mcpServers"].append(record)
+        return record
+
+    return await _mutate_store(mutator)
+
+
+async def upsert_mcp_server_connection(
+    server_name: str,
+    *,
+    user_id: str | None,
+    status: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = _now()
+
+    def mutator(store: Store) -> dict[str, Any]:
+        existing = next(
+            (
+                item
+                for item in store["mcpServerConnections"]
+                if item["serverName"] == server_name and item.get("userId") == user_id
+            ),
+            None,
+        )
+        if existing:
+            existing.update(
+                {
+                    "status": status,
+                    "metadata": metadata or existing.get("metadata", {}),
+                    "updatedAt": now,
+                }
+            )
+            return existing
+
+        record = {
+            "id": str(uuid.uuid4()),
+            "serverName": server_name,
+            "userId": user_id,
+            "status": status,
+            "metadata": metadata or {},
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        store["mcpServerConnections"].append(record)
+        return record
+
+    return await _mutate_store(mutator)
+
+
+async def sync_tool_registry(
+    server_name: str, tools: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    now = _now()
+
+    def mutator(store: Store) -> list[dict[str, Any]]:
+        seen_names: set[str] = set()
+        synced: list[dict[str, Any]] = []
+
+        for tool in tools:
+            tool_name = str(tool.get("name") or "").strip()
+            if not tool_name:
+                continue
+            seen_names.add(tool_name)
+
+            existing = next(
+                (item for item in store["toolRegistry"] if item["name"] == tool_name),
+                None,
+            )
+            payload = {
+                "serverName": server_name,
+                "name": tool_name,
+                "description": tool.get("description", ""),
+                "inputSchema": tool.get("inputSchema") or {},
+                "status": "available",
+                "updatedAt": now,
+            }
+            if existing:
+                existing.update(payload)
+                synced.append(existing)
+                continue
+
+            record = {
+                "id": str(uuid.uuid4()),
+                **payload,
+                "createdAt": now,
+            }
+            store["toolRegistry"].append(record)
+            synced.append(record)
+
+        for item in store["toolRegistry"]:
+            if item.get("serverName") == server_name and item.get("name") not in seen_names:
+                item["status"] = "inactive"
+                item["updatedAt"] = now
+
+        return synced
+
+    return await _mutate_store(mutator)
+
+
+async def list_tool_registry() -> list[dict[str, Any]]:
+    store = await read_store()
+    return sorted(
+        store["toolRegistry"],
+        key=lambda item: (item.get("serverName") or "", item.get("name") or ""),
     )

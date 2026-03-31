@@ -280,6 +280,21 @@ class Settings:
     # 3. 如果没找到，则为 None
     mem0_api_key: str | None = os.getenv("MEM0_API_KEY") or _discover_mem0_key()
 
+    # 可选的 Postgres / Supabase 连接
+    database_url: str | None = os.getenv("DATABASE_URL") or None
+    supabase_url: str | None = os.getenv("SUPABASE_URL") or None
+    supabase_service_role_key: str | None = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or None
+
+    # Agent 速率限制：默认 60 秒内最多 8 次运行
+    agent_rate_limit_count: int = int(os.getenv("AGENT_RATE_LIMIT_COUNT", "8"))
+    agent_rate_limit_window_seconds: int = int(
+        os.getenv("AGENT_RATE_LIMIT_WINDOW_SECONDS", "60")
+    )
+
+    # 估算模型成本时使用的单价，单位是“每百万 token 美元”
+    glm_input_price_per_1m: float = float(os.getenv("GLM_INPUT_PRICE_PER_1M", "0"))
+    glm_output_price_per_1m: float = float(os.getenv("GLM_OUTPUT_PRICE_PER_1M", "0"))
+
     # 应用状态存储文件路径
     store_file: Path = STORE_FILE
 
